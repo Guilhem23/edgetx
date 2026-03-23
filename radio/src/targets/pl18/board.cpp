@@ -312,7 +312,9 @@ void boardOff()
     WDG_RESET();
   }
 
+#if !defined(RADIO_NV14_FAMILY)
   SysTick->CTRL = 0; // turn off systick
+#endif
 
   // Shutdown the Haptic
   hapticDone();
@@ -323,14 +325,67 @@ void boardOff()
 #if defined(LED_STRIP_GPIO)
   ledStripOff();
 #endif
+#if !defined(RADIO_NV14_FAMILY)
   if (isChargerActive())
   {
     NVIC_SystemReset();
   }
   else
 #endif
-  {    
+#endif
+  {
+#if defined(RADIO_NV14_FAMILY) && !defined(BOOT)
+    // NV14: pwrOff() (gpio_clear PI.14) causes an immediate brownout reset
+    // which re-enters boardOff() in a tight loop — skip it entirely.
+    // Instead, keep the MCU alive and wait for a debounced release->press
+    // on the power button, then do a clean software reset.
+    // WAS_RESET_BY_WATCHDOG_OR_SOFTWARE() in edgeTxInit() will call pwrOn()
+    // and skip the startup animation, booting normally.
+    {
+      constexpr uint32_t RELEASE_STABLE_MS = 80U;
+      constexpr uint32_t PRESS_STABLE_MS   = 120U;
+      bool     armed        = false;
+      uint32_t releaseSince = 0;
+      uint32_t pressSince   = 0;
+
+      while (1) {
+        // __WFI() suspends the CPU until the next interrupt (SysTick 1ms).
+        // This avoids a full-speed busy-loop while waiting in pseudo-off state,
+        // reducing power consumption significantly without affecting debounce
+        // accuracy (SysTick still ticks every 1ms, so timersGetMsTick() is valid).
+        __WFI();
+
+        WDG_RESET();
+        uint32_t now     = timersGetMsTick();
+        bool     pressed = pwrPressed();
+
+        // USB cable plugged while pseudo-off: reset so boardInit() can
+        // enter the charging UI via its isChargerActive() branch.
+        // Use IS_UCHARGER_ACTIVE() to read the GPIO directly — isChargerActive()
+        // returns a stale cached value from the previous boot and won't re-sample.
+        if (IS_UCHARGER_ACTIVE()) NVIC_SystemReset();
+
+        if (!armed) {
+          pressSince = 0;
+          if (!pressed) {
+            if (releaseSince == 0)                          releaseSince = now;
+            else if ((now - releaseSince) >= RELEASE_STABLE_MS) armed = true;
+          } else {
+            releaseSince = 0;
+          }
+        } else {
+          if (pressed) {
+            if (pressSince == 0)                           pressSince = now;
+            else if ((now - pressSince) >= PRESS_STABLE_MS) NVIC_SystemReset();
+          } else {
+            pressSince = 0;
+          }
+        }
+      }
+    }
+#else
     pwrOff();
+#endif
   }
 
   // We reach here only in forced power situations, such as hw-debugging with external power  
