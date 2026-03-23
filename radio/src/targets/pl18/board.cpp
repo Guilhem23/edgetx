@@ -56,6 +56,8 @@
 
 #include <string.h>
 
+#include "stm32_hal.h"
+
 // Common ADC driver
 extern const etx_hal_adc_driver_t _adc_driver;
 
@@ -71,6 +73,77 @@ extern "C" void flushFTL();
 
 #if defined(RADIO_NV14_FAMILY)
   HardwareOptions hardwareOptions;
+
+#if !defined(BOOT)
+  static constexpr uint32_t NV14_SOFT_OFF_MAGIC = 0x4E563146U;  // "NV1F"
+  static volatile bool nv14WakeupRequest = false;
+
+  static inline void nv14EnableBackupAccess()
+  {
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+  }
+
+  static inline void nv14SetSoftOffMagic()
+  {
+    nv14EnableBackupAccess();
+    RTC->BKP0R = NV14_SOFT_OFF_MAGIC;
+  }
+
+  static inline bool nv14IsSoftOffMagicSet()
+  {
+    nv14EnableBackupAccess();
+    return (RTC->BKP0R == NV14_SOFT_OFF_MAGIC);
+  }
+
+  static inline void nv14ClearSoftOffMagic()
+  {
+    nv14EnableBackupAccess();
+    RTC->BKP0R = 0;
+  }
+
+  static inline bool nv14WakeupRequested()
+  {
+    return IS_UCHARGER_ACTIVE() || pwrPressed();
+  }
+
+  static void nv14WakeupIrq()
+  {
+    nv14WakeupRequest = true;
+  }
+
+  static void nv14EnableWakeupInterrupts()
+  {
+    gpio_init_int(PWR_SWITCH_GPIO, GPIO_IN_PU, GPIO_FALLING, nv14WakeupIrq);
+    gpio_init_int(UCHARGER_GPIO, GPIO_IN, GPIO_RISING, nv14WakeupIrq);
+  }
+
+  static void nv14DisableWakeupInterrupts()
+  {
+    gpio_int_disable(PWR_SWITCH_GPIO);
+    gpio_int_disable(UCHARGER_GPIO);
+  }
+
+  static void nv14PowerDownPeripherals()
+  {
+    INTERNAL_MODULE_OFF();
+    EXTERNAL_MODULE_OFF();
+    BLUETOOTH_MODULE_OFF();
+
+#if defined(LED_STRIP_GPIO)
+    ledStripOff();
+#endif
+
+#if defined(AUDIO_MUTE_GPIO)
+    gpio_init(AUDIO_MUTE_GPIO, GPIO_OUT, GPIO_PIN_SPEED_LOW);
+#if defined(INVERTED_MUTE_PIN)
+    gpio_clear(AUDIO_MUTE_GPIO);
+#else
+    gpio_set(AUDIO_MUTE_GPIO);
+#endif
+#endif
+  }
+#endif
 
   static uint8_t boardGetPcbRev()
   {
@@ -246,6 +319,17 @@ void boardInit()
   uint32_t press_start = 0;
   uint32_t press_end = 0;
 
+#if defined(RADIO_NV14_FAMILY) && !defined(BOOT)
+  if (UNEXPECTED_SHUTDOWN() && nv14IsSoftOffMagicSet()) {
+    if (nv14WakeupRequested()) {
+      nv14ClearSoftOffMagic();
+      pwrOn();
+    } else {
+      boardOff();
+    }
+  }
+#endif
+
   if (UNEXPECTED_SHUTDOWN()) {
     pwrOn();
   } else if (isChargerActive()) {
@@ -335,52 +419,39 @@ void boardOff()
 #endif
   {
 #if defined(RADIO_NV14_FAMILY) && !defined(BOOT)
-    // NV14: pwrOff() (gpio_clear PI.14) causes an immediate brownout reset
-    // which re-enters boardOff() in a tight loop — skip it entirely.
-    // Instead, keep the MCU alive and wait for a debounced release->press
-    // on the power button, then do a clean software reset.
-    // WAS_RESET_BY_WATCHDOG_OR_SOFTWARE() in edgeTxInit() will call pwrOn()
-    // and skip the startup animation, booting normally.
+    // NV14 has no true power-latch off path. Enter STOP mode and mark a
+    // software "off" state in RTC backup register so watchdog resets return
+    // here immediately until a real wake source (USB or power key) is active.
     {
-      constexpr uint32_t RELEASE_STABLE_MS = 80U;
-      constexpr uint32_t PRESS_STABLE_MS   = 120U;
-      bool     armed        = false;
-      uint32_t releaseSince = 0;
-      uint32_t pressSince   = 0;
+      nv14SetSoftOffMagic();
+      nv14PowerDownPeripherals();
+      nv14WakeupRequest = false;
+      nv14EnableWakeupInterrupts();
 
       while (1) {
-        // __WFI() suspends the CPU until the next interrupt (SysTick 1ms).
-        // This avoids a full-speed busy-loop while waiting in pseudo-off state,
-        // reducing power consumption significantly without affecting debounce
-        // accuracy (SysTick still ticks every 1ms, so timersGetMsTick() is valid).
-        __WFI();
-
+        // Watchdog must be reset before entering STOP mode (else it triggers
+        // after ~500ms and causes an immediate reset—but we'll detect soft-off
+        // magic in boardInit() and loop back here).
         WDG_RESET();
-        uint32_t now     = timersGetMsTick();
-        bool     pressed = pwrPressed();
 
-        // USB cable plugged while pseudo-off: reset so boardInit() can
-        // enter the charging UI via its isChargerActive() branch.
-        // Use IS_UCHARGER_ACTIVE() to read the GPIO directly — isChargerActive()
-        // returns a stale cached value from the previous boot and won't re-sample.
-        if (IS_UCHARGER_ACTIVE()) NVIC_SystemReset();
+        // Enter STOP mode (MCU clock off, EXTI wakes on power button press
+        // or USB charger detect). Regulator stays on to maintain SRAM/RTC.
+        // Wake on ISR sets nv14WakeupRequest to true.
+        HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
 
-        if (!armed) {
-          pressSince = 0;
-          if (!pressed) {
-            if (releaseSince == 0)                          releaseSince = now;
-            else if ((now - releaseSince) >= RELEASE_STABLE_MS) armed = true;
-          } else {
-            releaseSince = 0;
-          }
-        } else {
-          if (pressed) {
-            if (pressSince == 0)                           pressSince = now;
-            else if ((now - pressSince) >= PRESS_STABLE_MS) NVIC_SystemReset();
-          } else {
-            pressSince = 0;
-          }
+        // Immediately reset watchdog after wakeup from STOP
+        // (SysTick was stopped in STOP, so timersGetMsTick() may be stale)
+        WDG_RESET();
+
+        // Check if it's a _real_ wakeup (button pressed OR USB active right now).
+        // If false (noise/glitch), just loop back to STOP.
+        if (nv14WakeupRequest && nv14WakeupRequested()) {
+          nv14ClearSoftOffMagic();
+          nv14DisableWakeupInterrupts();
+          NVIC_SystemReset();
         }
+        // Glitch/noise: clear flag and loop back to STOP.
+        nv14WakeupRequest = false;
       }
     }
 #else
