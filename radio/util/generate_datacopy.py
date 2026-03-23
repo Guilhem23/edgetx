@@ -101,6 +101,8 @@ def main():
     args = ['-x', 'c++', '-std=c++11'] + sys.argv[2:]
     if find_clang.builtin_hdr_path:
         args.append("-I" + find_clang.builtin_hdr_path)
+    if getattr(find_clang, 'system_include_args', None):
+        args += find_clang.system_include_args
 
     translation_unit = index.parse(sys.argv[1], args)
 

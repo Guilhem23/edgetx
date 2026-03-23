@@ -5,6 +5,7 @@
 import os
 import sys
 import re
+import subprocess
 
 from clang.cindex import *
 
@@ -110,6 +111,54 @@ def findLibClang():
     # If no known path is found
     return None
 
+
+def getSystemIncludeArgs():
+    """
+    Resolve macOS libclang stdlib header search paths.
+    
+    On macOS, libclang's static index may fail to locate the C++ standard
+    library headers (libc++) required by firmware code generators
+    (generate_yaml.py, generate_datacopy.py). This function probes the
+    system for the correct SDK and C++ include paths from the local
+    Clang/Xcode toolchain, then returns compiler flags that allow libclang
+    to correctly parse firmware code.
+    
+    The returned flags (-isysroot, -isystem, -stdlib=libc++) are passed to
+    all libclang index operations, ensuring consistent parsing behavior
+    across different macOS versions and Xcode installations.
+    """
+    args = []
+
+    if sys.platform != "darwin":
+        return args
+
+    sdkroot = os.environ.get("SDKROOT", "").strip()
+    if not sdkroot:
+        try:
+            sdkroot = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
+        except Exception:
+            sdkroot = ""
+
+    cxx_candidates = []
+    if sdkroot:
+        cxx_candidates.append(os.path.join(sdkroot, "usr", "include", "c++", "v1"))
+
+    cxx_candidates.extend([
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1",
+        "/Library/Developer/CommandLineTools/usr/include/c++/v1",
+        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include/c++/v1",
+    ])
+
+    cxx_include = next((p for p in cxx_candidates if os.path.isdir(p)), None)
+
+    if sdkroot and os.path.isdir(sdkroot):
+        args.extend(["-isysroot", sdkroot])
+    if cxx_include:
+        args.extend(["-isystem", cxx_include])
+
+    args.append("-stdlib=libc++")
+    return args
+
 def initLibClang():
     global index
 
@@ -136,6 +185,11 @@ def initLibClang():
     builtin_hdr_path = getBuiltinHeaderPath(library_path)
     if builtin_hdr_path:
         print("builtin header path found: " + builtin_hdr_path, file=sys.stderr)
+
+    global system_include_args
+    system_include_args = getSystemIncludeArgs()
+    if system_include_args:
+        print("system include args: " + " ".join(system_include_args), file=sys.stderr)
 
     # Everything is OK, libclang can be used
     return True
